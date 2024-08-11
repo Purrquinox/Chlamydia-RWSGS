@@ -1,28 +1,27 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
-use uuid::Uuid;
 use warp::ws::{Message, WebSocket};
 use warp::Filter;
 use futures::{FutureExt, StreamExt};
 
-type Clients = Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Message>>>>;
-type Groups = Arc<Mutex<HashMap<String, HashSet<Uuid>>>>;
+type Clients = Arc<Mutex<HashMap<String, HashSet<mpsc::UnboundedSender<Message>>>>>;
+type Creators = Arc<Mutex<HashMap<String, String>>>;
 
 #[tokio::main]
 async fn main() {
     let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
-    let groups: Groups = Arc::new(Mutex::new(HashMap::new()));
+    let creators: Creators = Arc::new(Mutex::new(HashMap::new()));
 
     let clients_filter = warp::any().map(move || Arc::clone(&clients));
-    let groups_filter = warp::any().map(move || Arc::clone(&groups));
+    let creators_filter = warp::any().map(move || Arc::clone(&creators));
 
     let ws_route = warp::path("ws")
         .and(warp::ws())
         .and(clients_filter)
-        .and(groups_filter)
-        .map(|ws: warp::ws::Ws, clients, groups| {
-            ws.on_upgrade(move |socket| handle_connection(socket, clients, groups))
+        .and(creators_filter)
+        .map(|ws: warp::ws::Ws, clients, creators| {
+            ws.on_upgrade(move |socket| handle_connection(socket, clients, creators))
         });
 
     let routes = ws_route.with(warp::cors().allow_any_origin());
@@ -33,15 +32,14 @@ async fn main() {
 async fn handle_connection(
     ws: WebSocket,
     clients: Clients,
-    groups: Groups,
+    creators: Creators,
 ) {
     let (user_ws_tx, mut user_ws_rx) = ws.split();
     let (tx, rx) = mpsc::unbounded_channel();
     let rx = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
 
-    let user_id = Uuid::new_v4();
-
-    clients.lock().unwrap().insert(user_id, tx);
+    let mut group_id = None;
+    let mut is_system = false;
 
     tokio::task::spawn(rx.forward(user_ws_tx).map(|result| {
         if let Err(e) = result {
@@ -51,71 +49,98 @@ async fn handle_connection(
 
     while let Some(result) = user_ws_rx.next().await {
         match result {
-            Ok(msg) => handle_message(user_id, msg, &clients, &groups).await,
+            Ok(msg) => {
+                if group_id.is_none() {
+                    if let Ok(payload) = msg.to_str() {
+                        let parts: Vec<&str> = payload.splitn(3, ' ').collect();
+                        if parts.len() == 3 && parts[0] == "/auth" {
+                            group_id = Some(parts[1].to_string());
+                            is_system = parts[2] == "SYSTEM";
+                            create_or_join_group(&group_id.as_ref().unwrap(), &tx, &clients, &creators, is_system).await;
+                        } else {
+                            break;
+                        }
+                    }
+                } else if let Some(ref gid) = group_id {
+                    broadcast_message(gid, msg, &clients).await;
+                }
+            }
             Err(e) => {
-                eprintln!("websocket error(uid={}): {}", user_id, e);
+                eprintln!("websocket error: {}", e);
                 break;
             }
         }
     }
 
-    clients.lock().unwrap().remove(&user_id);
-    remove_user_from_groups(user_id, &groups);
+    if let Some(gid) = group_id {
+        handle_disconnect(&gid, &tx, &clients, &creators, is_system).await;
+    }
 }
 
-async fn handle_message(
-    user_id: Uuid,
-    msg: Message,
+async fn create_or_join_group(
+    group_id: &str,
+    tx: &mpsc::UnboundedSender<Message>,
     clients: &Clients,
-    groups: &Groups,
+    creators: &Creators,
+    is_system: bool,
 ) {
-    let msg_text = if let Ok(text) = msg.to_str() {
-        text
-    } else {
-        return;
-    };
+    let mut clients = clients.lock().unwrap();
+    let mut creators = creators.lock().unwrap();
 
-    let parts: Vec<&str> = msg_text.splitn(2, ' ').collect();
-    if parts.len() != 2 {
-        return;
+    if is_system {
+        if creators.contains_key(group_id) {
+            let _ = tx.send(Message::text("/error UUID already in use by another system"));
+            return;
+        }
+
+        creators.insert(group_id.to_string(), group_id.to_string());
+    } else {
+        if !creators.contains_key(group_id) {
+            let _ = tx.send(Message::text("/error No system found for the provided UUID"));
+            return;
+        }
     }
 
-    match parts[0] {
-        "/join" => {
-            let group_name = parts[1];
-            let mut groups = groups.lock().unwrap();
-            let group = groups.entry(group_name.to_string()).or_insert_with(HashSet::new);
-            group.insert(user_id);
-        }
-        "/leave" => {
-            let group_name = parts[1];
-            let mut groups = groups.lock().unwrap();
-            if let Some(group) = groups.get_mut(group_name) {
-                group.remove(&user_id);
-                if group.is_empty() {
-                    groups.remove(group_name);
-                }
+    let group_clients = clients.entry(group_id.to_string()).or_insert_with(HashSet::new);
+    group_clients.insert(tx.clone());
+}
+
+
+async fn handle_disconnect(
+    group_id: &str,
+    tx: &mpsc::UnboundedSender<Message>,
+    clients: &Clients,
+    creators: &Creators,
+    is_system: bool,
+) {
+    let mut clients = clients.lock().unwrap();
+    if let Some(group_clients) = clients.get_mut(group_id) {
+        group_clients.remove(tx);
+        if is_system || group_clients.is_empty() {
+            clients.remove(group_id);
+            if is_system {
+                let mut creators = creators.lock().unwrap();
+                creators.remove(group_id);
+                send_disconnect_to_services(group_id, &clients).await;
             }
         }
-        "/msg" => {
-            let group_name = parts[1];
-            let groups = groups.lock().unwrap();
-            if let Some(group) = groups.get(group_name) {
-                let clients = clients.lock().unwrap();
-                for uid in group {
-                    if let Some(client) = clients.get(uid) {
-                        let _ = client.send(Message::text(msg_text));
-                    }
-                }
-            }
-        }
-        _ => {}
     }
 }
 
-fn remove_user_from_groups(user_id: Uuid, groups: &Groups) {
-    let mut groups = groups.lock().unwrap();
-    for (_, group) in groups.iter_mut() {
-        group.remove(&user_id);
+async fn send_disconnect_to_services(group_id: &str, clients: &Clients) {
+    let clients = clients.lock().unwrap();
+    if let Some(group_clients) = clients.get(group_id) {
+        for client in group_clients {
+            let _ = client.send(Message::text("/disconnect"));
+        }
+    }
+}
+
+async fn broadcast_message(group_id: &str, msg: Message, clients: &Clients) {
+    let clients = clients.lock().unwrap();
+    if let Some(group_clients) = clients.get(group_id) {
+        for client in group_clients {
+            let _ = client.send(msg.clone());
+        }
     }
 }
