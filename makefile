@@ -8,7 +8,7 @@ COMBOS := linux/amd64 linux/arm64 windows/amd64 windows/arm64
 
 all:
 	@echo "Building in debug mode..."
-	cargo build
+	cargo build -Z unstable-options --out-dir bin
 
 release:
 	@python build_release.py

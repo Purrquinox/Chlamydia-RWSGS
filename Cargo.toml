@@ -7,7 +7,8 @@ edition = "2021"
 linker = "x86_64-w64-mingw32-gcc"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.39", features = ["full"] }
+tokio-stream = "0.1"
 warp = "0.3"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
