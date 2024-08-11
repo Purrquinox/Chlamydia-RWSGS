@@ -1,9 +1,11 @@
 use futures::{FutureExt, StreamExt};
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use warp::ws::{Message, WebSocket};
 use warp::Filter;
+use tokio::time::{self, Duration};
 
 type Clients = Arc<Mutex<HashMap<String, HashSet<mpsc::UnboundedSender<Message>>>>>;
 type Systems = Arc<Mutex<HashMap<String, String>>>;
@@ -36,6 +38,9 @@ async fn handle_connection(ws: WebSocket, clients: Clients, systems: Systems) {
 
     let mut group_id = None;
     let mut is_system = false;
+    let mut last_pong = time::Instant::now();
+    let ping_interval = Duration::from_secs(30);
+    let timeout = Duration::from_secs(60);
 
     tokio::task::spawn(rx.forward(user_ws_tx).map(|result| {
         if let Err(e) = result {
@@ -43,29 +48,29 @@ async fn handle_connection(ws: WebSocket, clients: Clients, systems: Systems) {
         }
     }));
 
+    // PING loop
+    let ping_tx = tx.clone();
+    tokio::spawn(async move {
+        let mut interval = time::interval(ping_interval);
+        loop {
+            interval.tick().await;
+            if last_pong.elapsed() > timeout {
+                eprintln!("Connection timed out, disconnecting.");
+                break;
+            }
+            if ping_tx.send(Message::ping(vec![])).is_err() {
+                break;
+            }
+        }
+    });
+
     while let Some(result) = user_ws_rx.next().await {
         match result {
             Ok(msg) => {
-                if group_id.is_none() {
-                    if let Ok(payload) = msg.to_str() {
-                        let parts: Vec<&str> = payload.splitn(3, ' ').collect();
-                        if parts.len() == 3 && parts[0] == "/auth" {
-                            group_id = Some(parts[1].to_string());
-                            is_system = parts[2] == "SYSTEM";
-                            create_or_join_group(
-                                &group_id.as_ref().unwrap(),
-                                &tx,
-                                &clients,
-                                &systems,
-                                is_system,
-                            )
-                            .await;
-                        } else {
-                            break;
-                        }
-                    }
-                } else if let Some(ref gid) = group_id {
-                    broadcast_message(gid, msg, &clients).await;
+                if msg.is_pong() {
+                    last_pong = time::Instant::now();
+                } else if let Ok(payload) = msg.to_str() {
+                    handle_incoming_message(payload, &mut group_id, &tx, &clients, &systems, &mut is_system).await;
                 }
             }
             Err(e) => {
@@ -80,6 +85,66 @@ async fn handle_connection(ws: WebSocket, clients: Clients, systems: Systems) {
     }
 }
 
+async fn handle_incoming_message(
+    payload: &str,
+    group_id: &mut Option<String>,
+    tx: &mpsc::UnboundedSender<Message>,
+    clients: &Clients,
+    systems: &Systems,
+    is_system: &mut bool,
+) {
+    let message: serde_json::Value = match serde_json::from_str(payload) {
+        Ok(val) => val,
+        Err(_) => {
+            let _ = tx.send(Message::text(json!({
+                "type": "ERROR",
+                "message": "Invalid message format"
+            }).to_string()));
+            return;
+        }
+    };
+
+    match message["type"].as_str() {
+        Some("CONNECT") => {
+            if let Some(id) = message["group_id"].as_str() {
+                if let Some(role) = message["role"].as_str() {
+                    if role == "SYSTEM" || role == "SERVICE" {
+                        *group_id = Some(id.to_string());
+                        *is_system = role == "SYSTEM";
+                        create_or_join_group(id, tx, clients, systems, *is_system).await;
+                        let _ = tx.send(Message::text(json!({
+                            "type": "LOG",
+                            "message": "Connected to group"
+                        }).to_string()));
+                    } else {
+                        let _ = tx.send(Message::text(json!({
+                            "type": "ERROR",
+                            "message": "Invalid role, must be 'SYSTEM' or 'SERVICE'"
+                        }).to_string()));
+                    }
+                }
+            }
+        }
+        Some("LOG") | Some("DEBUG") | Some("ERROR") => {
+            if let Some(ref gid) = group_id {
+                broadcast_message(gid, Message::text(payload.to_string()), clients).await;
+            }
+        }
+        Some(_) => {
+            let _ = tx.send(Message::text(json!({
+                "type": "ERROR",
+                "message": "Unknown message type"
+            }).to_string()));
+        }
+        None => {
+            let _ = tx.send(Message::text(json!({
+                "type": "ERROR",
+                "message": "Invalid message, 'type' field missing"
+            }).to_string()));
+        }
+    }
+}
+
 async fn create_or_join_group(
     group_id: &str,
     tx: &mpsc::UnboundedSender<Message>,
@@ -91,22 +156,20 @@ async fn create_or_join_group(
     let mut systems = systems.lock().unwrap();
 
     if is_system {
-        // Check if the UUID is already associated with another system
         if systems.contains_key(group_id) {
-            let _ = tx.send(Message::text(
-                "/error UUID already in use by another system",
-            ));
+            let _ = tx.send(Message::text(json!({
+                "type": "ERROR",
+                "message": "UUID already in use by another system"
+            }).to_string()));
             return;
         }
-
-        // Register this UUID as the system's UUID
         systems.insert(group_id.to_string(), group_id.to_string());
     } else {
-        // Ensure that the group exists for services to join
         if !systems.contains_key(group_id) {
-            let _ = tx.send(Message::text(
-                "/error No system found for the provided UUID",
-            ));
+            let _ = tx.send(Message::text(json!({
+                "type": "ERROR",
+                "message": "No system found for the provided UUID"
+            }).to_string()));
             return;
         }
     }
@@ -132,17 +195,11 @@ async fn handle_disconnect(
             if is_system {
                 let mut systems = systems.lock().unwrap();
                 systems.remove(group_id);
-                send_disconnect_to_services(group_id, &clients).await;
+                broadcast_message(group_id, Message::text(json!({
+                    "type": "DISCONNECT",
+                    "message": "System disconnected"
+                }).to_string()), clients).await;
             }
-        }
-    }
-}
-
-async fn send_disconnect_to_services(group_id: &str, clients: &Clients) {
-    let clients = clients.lock().unwrap();
-    if let Some(group_clients) = clients.get(group_id) {
-        for client in group_clients {
-            let _ = client.send(Message::text("/disconnect"));
         }
     }
 }
