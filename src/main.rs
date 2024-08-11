@@ -1,9 +1,9 @@
+use futures::{FutureExt, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use warp::ws::{Message, WebSocket};
 use warp::Filter;
-use futures::{FutureExt, StreamExt};
 
 type Clients = Arc<Mutex<HashMap<String, HashSet<mpsc::UnboundedSender<Message>>>>>;
 type Creators = Arc<Mutex<HashMap<String, String>>>;
@@ -29,11 +29,7 @@ async fn main() {
     warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
 }
 
-async fn handle_connection(
-    ws: WebSocket,
-    clients: Clients,
-    creators: Creators,
-) {
+async fn handle_connection(ws: WebSocket, clients: Clients, creators: Creators) {
     let (user_ws_tx, mut user_ws_rx) = ws.split();
     let (tx, rx) = mpsc::unbounded_channel();
     let rx = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
@@ -56,7 +52,14 @@ async fn handle_connection(
                         if parts.len() == 3 && parts[0] == "/auth" {
                             group_id = Some(parts[1].to_string());
                             is_system = parts[2] == "SYSTEM";
-                            create_or_join_group(&group_id.as_ref().unwrap(), &tx, &clients, &creators, is_system).await;
+                            create_or_join_group(
+                                &group_id.as_ref().unwrap(),
+                                &tx,
+                                &clients,
+                                &creators,
+                                is_system,
+                            )
+                            .await;
                         } else {
                             break;
                         }
@@ -89,22 +92,27 @@ async fn create_or_join_group(
 
     if is_system {
         if creators.contains_key(group_id) {
-            let _ = tx.send(Message::text("/error UUID already in use by another system"));
+            let _ = tx.send(Message::text(
+                "/error UUID already in use by another system",
+            ));
             return;
         }
 
         creators.insert(group_id.to_string(), group_id.to_string());
     } else {
         if !creators.contains_key(group_id) {
-            let _ = tx.send(Message::text("/error No system found for the provided UUID"));
+            let _ = tx.send(Message::text(
+                "/error No system found for the provided UUID",
+            ));
             return;
         }
     }
 
-    let group_clients = clients.entry(group_id.to_string()).or_insert_with(HashSet::new);
+    let group_clients = clients
+        .entry(group_id.to_string())
+        .or_insert_with(HashSet::new);
     group_clients.insert(tx.clone());
 }
-
 
 async fn handle_disconnect(
     group_id: &str,
