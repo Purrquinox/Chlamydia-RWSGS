@@ -6,22 +6,22 @@ use warp::ws::{Message, WebSocket};
 use warp::Filter;
 
 type Clients = Arc<Mutex<HashMap<String, HashSet<mpsc::UnboundedSender<Message>>>>>;
-type Creators = Arc<Mutex<HashMap<String, String>>>;
+type Systems = Arc<Mutex<HashMap<String, String>>>;
 
 #[tokio::main]
 async fn main() {
     let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
-    let creators: Creators = Arc::new(Mutex::new(HashMap::new()));
+    let systems: Systems = Arc::new(Mutex::new(HashMap::new()));
 
     let clients_filter = warp::any().map(move || Arc::clone(&clients));
-    let creators_filter = warp::any().map(move || Arc::clone(&creators));
+    let systems_filter = warp::any().map(move || Arc::clone(&systems));
 
     let ws_route = warp::path("ws")
         .and(warp::ws())
         .and(clients_filter)
-        .and(creators_filter)
-        .map(|ws: warp::ws::Ws, clients, creators| {
-            ws.on_upgrade(move |socket| handle_connection(socket, clients, creators))
+        .and(systems_filter)
+        .map(|ws: warp::ws::Ws, clients, systems| {
+            ws.on_upgrade(move |socket| handle_connection(socket, clients, systems))
         });
 
     let routes = ws_route.with(warp::cors().allow_any_origin());
@@ -29,7 +29,7 @@ async fn main() {
     warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
 }
 
-async fn handle_connection(ws: WebSocket, clients: Clients, creators: Creators) {
+async fn handle_connection(ws: WebSocket, clients: Clients, systems: Systems) {
     let (user_ws_tx, mut user_ws_rx) = ws.split();
     let (tx, rx) = mpsc::unbounded_channel();
     let rx = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
@@ -56,7 +56,7 @@ async fn handle_connection(ws: WebSocket, clients: Clients, creators: Creators) 
                                 &group_id.as_ref().unwrap(),
                                 &tx,
                                 &clients,
-                                &creators,
+                                &systems,
                                 is_system,
                             )
                             .await;
@@ -76,7 +76,7 @@ async fn handle_connection(ws: WebSocket, clients: Clients, creators: Creators) 
     }
 
     if let Some(gid) = group_id {
-        handle_disconnect(&gid, &tx, &clients, &creators, is_system).await;
+        handle_disconnect(&gid, &tx, &clients, &systems, is_system).await;
     }
 }
 
@@ -84,23 +84,26 @@ async fn create_or_join_group(
     group_id: &str,
     tx: &mpsc::UnboundedSender<Message>,
     clients: &Clients,
-    creators: &Creators,
+    systems: &Systems,
     is_system: bool,
 ) {
     let mut clients = clients.lock().unwrap();
-    let mut creators = creators.lock().unwrap();
+    let mut systems = systems.lock().unwrap();
 
     if is_system {
-        if creators.contains_key(group_id) {
+        // Check if the UUID is already associated with another system
+        if systems.contains_key(group_id) {
             let _ = tx.send(Message::text(
                 "/error UUID already in use by another system",
             ));
             return;
         }
 
-        creators.insert(group_id.to_string(), group_id.to_string());
+        // Register this UUID as the system's UUID
+        systems.insert(group_id.to_string(), group_id.to_string());
     } else {
-        if !creators.contains_key(group_id) {
+        // Ensure that the group exists for services to join
+        if !systems.contains_key(group_id) {
             let _ = tx.send(Message::text(
                 "/error No system found for the provided UUID",
             ));
@@ -118,7 +121,7 @@ async fn handle_disconnect(
     group_id: &str,
     tx: &mpsc::UnboundedSender<Message>,
     clients: &Clients,
-    creators: &Creators,
+    systems: &Systems,
     is_system: bool,
 ) {
     let mut clients = clients.lock().unwrap();
@@ -127,8 +130,8 @@ async fn handle_disconnect(
         if is_system || group_clients.is_empty() {
             clients.remove(group_id);
             if is_system {
-                let mut creators = creators.lock().unwrap();
-                creators.remove(group_id);
+                let mut systems = systems.lock().unwrap();
+                systems.remove(group_id);
                 send_disconnect_to_services(group_id, &clients).await;
             }
         }
